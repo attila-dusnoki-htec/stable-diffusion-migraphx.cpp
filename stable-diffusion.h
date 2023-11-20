@@ -46,6 +46,10 @@ class StableDiffusion {
                     bool free_params_immediately = false,
                     RNGType rng_type = STD_DEFAULT_RNG);
     bool load_from_file(const std::string& file_path, Schedule d = DEFAULT);
+    bool load_migraphx_from_file(
+        const std::string& text_encoder_file_path,
+        const std::string& unet_file_path,
+        const std::string& decoder_file_path);
     std::vector<uint8_t> txt2img(
         const std::string& prompt,
         const std::string& negative_prompt,
@@ -54,7 +58,8 @@ class StableDiffusion {
         int height,
         SampleMethod sample_method,
         int sample_steps,
-        int64_t seed);
+        int64_t seed,
+        bool use_migraphx);
     std::vector<uint8_t> img2img(
         const std::vector<uint8_t>& init_img,
         const std::string& prompt,
@@ -65,7 +70,8 @@ class StableDiffusion {
         SampleMethod sample_method,
         int sample_steps,
         float strength,
-        int64_t seed);
+        int64_t seed,
+        bool use_migraphx);
 };
 
 void set_sd_log_level(SDLogLevel level);

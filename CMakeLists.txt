@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.12)
 project("stable-diffusion")
 
+set(CMAKE_CXX_STANDARD 17)
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 if (NOT XCODE AND NOT MSVC AND NOT CMAKE_BUILD_TYPE)
@@ -16,6 +18,12 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 else()
     set(SD_STANDALONE OFF)
 endif()
+
+set(ROCM_PATH /opt/rocm)
+set(HIP_PATH "${ROCM_PATH}/hip")
+list(APPEND CMAKE_PREFIX_PATH ${ROCM_PATH} ${HIP_PATH})
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O3 -W -Wall -pthread -D__HIP_PLATFORM_HCC__=1")
+find_package(migraphx REQUIRED)
 
 #
 # Option list
@@ -34,8 +42,8 @@ add_subdirectory(ggml)
 set(SD_LIB stable-diffusion)
 
 add_library(${SD_LIB} stable-diffusion.h stable-diffusion.cpp)
-target_link_libraries(${SD_LIB} PUBLIC ggml)
-target_include_directories(${SD_LIB} PUBLIC .)
+target_link_libraries(${SD_LIB} PUBLIC ggml migraphx::c hip::device)
+target_include_directories(${SD_LIB} PUBLIC . ${ROCM_PATH})
 target_compile_features(${SD_LIB} PUBLIC cxx_std_11)
 
 

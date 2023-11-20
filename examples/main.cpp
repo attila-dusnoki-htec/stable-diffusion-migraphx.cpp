@@ -92,6 +92,9 @@ struct Option {
     int n_threads = -1;
     std::string mode = TXT2IMG;
     std::string model_path;
+    std::string text_encoder_path;
+    std::string unet_path;
+    std::string decoder_path;
     std::string output_path = "output.png";
     std::string init_img;
     std::string prompt;
@@ -106,12 +109,16 @@ struct Option {
     RNGType rng_type = CUDA_RNG;
     int64_t seed = 42;
     bool verbose = false;
+    bool use_migraphx = false;
 
     void print() {
         printf("Option: \n");
         printf("    n_threads:       %d\n", n_threads);
         printf("    mode:            %s\n", mode.c_str());
         printf("    model_path:      %s\n", model_path.c_str());
+        printf("    text_encoder_path:%s\n", text_encoder_path.c_str());
+        printf("    unet_path:       %s\n", unet_path.c_str());
+        printf("    decoder_path:    %s\n", decoder_path.c_str());
         printf("    output_path:     %s\n", output_path.c_str());
         printf("    init_img:        %s\n", init_img.c_str());
         printf("    prompt:          %s\n", prompt.c_str());
@@ -137,6 +144,9 @@ void print_usage(int argc, const char* argv[]) {
     printf("  -t, --threads N                    number of threads to use during computation (default: -1).\n");
     printf("                                     If threads <= 0, then threads will be set to the number of CPU physical cores\n");
     printf("  -m, --model [MODEL]                path to model\n");
+    printf("  --text-encoder-model-path [MODEL]  path to text-encoder model\n");
+    printf("  --unet-model-path [MODEL]          path to unet model\n");
+    printf("  --decoder-model-path [MODEL]       path to decoder model\n");
     printf("  -i, --init-img [IMAGE]             path to the input image, required by img2img\n");
     printf("  -o, --output OUTPUT                path to write result image to (default: .\\output.png)\n");
     printf("  -p, --prompt [PROMPT]              the prompt to render\n");
@@ -153,6 +163,7 @@ void print_usage(int argc, const char* argv[]) {
     printf("  -s SEED, --seed SEED               RNG seed (default: 42, use random seed for < 0)\n");
     printf("  --schedule {discrete, karras}      Denoiser sigma schedule (default: discrete)\n");
     printf("  -v, --verbose                      print extra info\n");
+    printf("  --use-migraphx                     use migraphx\n");
 }
 
 void parse_args(int argc, const char* argv[], Option* opt) {
@@ -180,6 +191,24 @@ void parse_args(int argc, const char* argv[], Option* opt) {
                 break;
             }
             opt->model_path = argv[i];
+        } else if (arg == "--text-encoder-model-path") {
+            if (++i >= argc) {
+                invalid_arg = true;
+                break;
+            }
+            opt->text_encoder_path = argv[i];
+        } else if (arg == "--unet-model-path") {
+            if (++i >= argc) {
+                invalid_arg = true;
+                break;
+            }
+            opt->unet_path = argv[i];
+        } else if (arg == "--decoder-model-path") {
+            if (++i >= argc) {
+                invalid_arg = true;
+                break;
+            }
+            opt->decoder_path = argv[i];
         } else if (arg == "-i" || arg == "--init-img") {
             if (++i >= argc) {
                 invalid_arg = true;
@@ -293,6 +322,8 @@ void parse_args(int argc, const char* argv[], Option* opt) {
             exit(0);
         } else if (arg == "-v" || arg == "--verbose") {
             opt->verbose = true;
+        } else if (arg == "--use-migraphx") {
+            opt->use_migraphx = true;
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             print_usage(argc, argv);
@@ -323,6 +354,24 @@ void parse_args(int argc, const char* argv[], Option* opt) {
 
     if (opt->model_path.length() == 0) {
         fprintf(stderr, "error: the following arguments are required: model_path\n");
+        print_usage(argc, argv);
+        exit(1);
+    }
+
+    if (opt->use_migraphx && opt->text_encoder_path.length() == 0) {
+        fprintf(stderr, "error: the following arguments are required: text-encoder-model-path\n");
+        print_usage(argc, argv);
+        exit(1);
+    }
+
+    if (opt->use_migraphx && opt->unet_path.length() == 0) {
+        fprintf(stderr, "error: the following arguments are required: unet-model-path\n");
+        print_usage(argc, argv);
+        exit(1);
+    }
+
+    if (opt->use_migraphx && opt->decoder_path.length() == 0) {
+        fprintf(stderr, "error: the following arguments are required: decoder-model-path\n");
         print_usage(argc, argv);
         exit(1);
     }
@@ -421,6 +470,10 @@ int main(int argc, const char* argv[]) {
         return 1;
     }
 
+    if (opt.use_migraphx &&!sd.load_migraphx_from_file(opt.text_encoder_path, opt.unet_path, opt.decoder_path)) {
+        return 1;
+    }
+
     std::vector<uint8_t> img;
     if (opt.mode == TXT2IMG) {
         img = sd.txt2img(opt.prompt,
@@ -430,7 +483,8 @@ int main(int argc, const char* argv[]) {
                          opt.h,
                          opt.sample_method,
                          opt.sample_steps,
-                         opt.seed);
+                         opt.seed,
+                         opt.use_migraphx);
     } else {
         img = sd.img2img(init_img,
                          opt.prompt,
@@ -441,7 +495,8 @@ int main(int argc, const char* argv[]) {
                          opt.sample_method,
                          opt.sample_steps,
                          opt.strength,
-                         opt.seed);
+                         opt.seed,
+                         opt.use_migraphx);
     }
 
     if (img.size() == 0) {
@@ -458,6 +513,9 @@ int main(int argc, const char* argv[]) {
     parameter_string += "Seed: " + std::to_string(opt.seed) + ", ";
     parameter_string += "Size: " + std::to_string(opt.w) + "x" + std::to_string(opt.h) + ", ";
     parameter_string += "Model: " + basename(opt.model_path) + ", ";
+    parameter_string += "Text Encoder Model: " + basename(opt.text_encoder_path) + ", ";
+    parameter_string += "Unet Model: " + basename(opt.unet_path) + ", ";
+    parameter_string += "Decoder Model: " + basename(opt.decoder_path) + ", ";
     parameter_string += "RNG: " + std::string(rng_type_to_str[opt.rng_type]) + ", ";
     parameter_string += "Sampler: " + std::string(sample_method_str[opt.sample_method]);
     if (opt.schedule == KARRAS) {

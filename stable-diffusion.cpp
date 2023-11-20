@@ -18,6 +18,12 @@
 #include "rng_philox.h"
 #include "stable-diffusion.h"
 
+#include <migraphx/migraphx.hpp>
+#include <filesystem>
+#include <chrono>
+
+// #include <hip/hip_runtime_api.h>
+
 #define EPS 1e-05f
 
 static SDLogLevel log_level = SDLogLevel::INFO;
@@ -61,6 +67,137 @@ enum ModelType {
 const char* model_type_to_str[] = {
     "SD1.x",
     "SD2.x"};
+
+/*================================================== MIGraphX Model ================================================*/
+
+struct TensorInfo
+{
+    std::string name;
+    std::vector<size_t> dims;
+    size_t size_in_bytes;
+    unsigned int location;
+
+    void Resize(size_t new_batch_size)
+    {
+        auto old_batch_size = dims[0];
+        dims[0] = new_batch_size;
+        size_in_bytes = size_in_bytes / old_batch_size * new_batch_size;
+    }
+};
+
+struct ProgramParams
+{
+    std::string model_path;
+    std::string cal_dir_path;
+    // TODO use enum
+    bool use_fp16 = false;
+    bool use_int8 = false;
+    // TODO add it to the parser
+    bool force_compile = false;
+    std::vector<TensorInfo> input_tensors;
+    std::vector<TensorInfo> output_tensors;
+    // can be used for creating unique filename
+    std::string filename_extra{""};
+};
+
+static migraphx::program LoadProgram(size_t device_id, const ProgramParams &params, const std::string target = "gpu") {
+    LOG_INFO("Load model (device id: %zu)", device_id);
+    // hipSetDevice(device_id);
+
+    bool force_compile = params.force_compile;
+    std::filesystem::path compiled_path(params.model_path);
+    if (compiled_path.extension() != ".mxr")
+    {
+        compiled_path.replace_extension();
+        compiled_path += params.use_int8 ? std::string("_i8") : (std::string("_fp") + std::to_string(params.use_fp16 ? 16 : 32));
+        compiled_path += std::string("_d") + std::to_string(device_id);
+        compiled_path += std::string("_") + target;
+        if (not params.filename_extra.empty())
+        {
+            compiled_path += std::string("_") + params.filename_extra;
+        }
+        compiled_path.replace_extension(".mxr");
+    }
+    else
+    {
+        if (force_compile)
+        {
+            force_compile = false;
+            LOG_INFO("MXR file provided, ignore force-compile flag.");
+        }
+    }
+
+    migraphx::file_options file_options;
+    file_options.set_file_format("msgpack");
+
+    migraphx::program prog;
+
+    std::ifstream f(compiled_path.c_str());
+    if (f.good() and not force_compile)
+    {
+        LOG_INFO("Load from mxr: %s", compiled_path.c_str());
+        prog = migraphx::load(compiled_path.c_str(), file_options);
+    }
+    else
+    {
+        LOG_INFO("Load Onnx from %s", params.model_path.c_str());
+        migraphx::onnx_options onnx_opts;
+        for (const auto &tensor_info : params.input_tensors)
+        {
+            onnx_opts.set_input_parameter_shape(tensor_info.name, tensor_info.dims);
+        }
+        migraphx::target targ = migraphx::target(target.c_str());
+
+        prog = parse_onnx(params.model_path.c_str(), onnx_opts);
+
+        if (params.use_int8)
+        {
+            LOG_INFO("Quantize model int8");
+            throw std::runtime_error("Unsupported!");
+            // migraphx::quantize_int8_options quant_opts;
+            // auto param_shapes = prog.get_parameter_shapes();
+            // LOG_INFO("Loading calibration data from %s", params.cal_dir_path);
+
+            // std::vector<std::vector<char>> calib_data;
+            // calib_data.reserve(params.input_tensors.size());
+            // for (auto &tensor : params.input_tensors)
+            // {
+            //     std::filesystem::path filepath(params.cal_dir_path + '/' + tensor.name + ".npy");
+            //     LOG_DEBUG("Check %s for %s", filepath.c_str(), tensor.name);
+
+            //     npy::NpyFile input_data(filepath);
+
+            //     auto load_size = std::max(input_data.GetTensorSize(), tensor.size_in_bytes);
+            //     calib_data.push_back(std::vector<char>(load_size));
+            //     input_data.LoadAll(calib_data.back().data());
+
+            //     for (size_t offset = 0; offset < load_size; offset += tensor.size_in_bytes)
+            //     {
+            //         migraphx::program_parameters quant_params;
+            //         quant_params.add(tensor.name.c_str(), migraphx::argument(param_shapes[tensor.name.c_str()], static_cast<char *>(calib_data.back().data()) + offset));
+            //         quant_opts.add_calibration_data(quant_params);
+            //     }
+            // }
+
+            // migraphx::quantize_int8(prog, targ, quant_opts);
+        }
+        else if (params.use_fp16)
+        {
+            LOG_INFO("Quantize model fp16");
+            migraphx::quantize_fp16(prog);
+        }
+
+        LOG_INFO("Compile model");
+        migraphx::compile_options comp_opts;
+        // TODO use hip buffers
+        comp_opts.set_offload_copy(true);
+        prog.compile(targ, comp_opts);
+
+        LOG_INFO("Save mxr to: %s", compiled_path.c_str());
+        migraphx::save(prog, compiled_path.c_str(), file_options);
+    }
+    return prog;
+}
 
 /*================================================== Helper Functions ================================================*/
 
@@ -2796,6 +2933,11 @@ class StableDiffusionGGML {
 
     std::shared_ptr<Denoiser> denoiser = std::make_shared<CompVisDenoiser>();
 
+    // migraphx
+    migraphx::program text_encoder_model;
+    migraphx::program unet_model;
+    migraphx::program vae_decoder_model;
+
     StableDiffusionGGML() = default;
 
     StableDiffusionGGML(int n_threads,
@@ -4190,6 +4332,757 @@ class StableDiffusionGGML {
 
         return result_img;
     }
+
+/*================================================= StableDiffusion MIGraphX ==================================================*/
+
+    bool load_migraphx_from_file(const std::string& text_encoder_file_path, const std::string& unet_file_path, const std::string& decoder_file_path) {
+        // text-encoder
+        {
+            ProgramParams text_encoder_params{};
+            text_encoder_params.model_path = text_encoder_file_path;
+            std::vector<size_t> input_dims = {1, 77};
+            text_encoder_params.input_tensors = {TensorInfo{"input_ids", input_dims, std::accumulate(input_dims.begin(), input_dims.end(), 1, std::multiplies<size_t>()) * sizeof(int32_t), 0}};
+            this->text_encoder_model = LoadProgram(/*device_id*/ 0, text_encoder_params);
+        }
+
+        // unet
+        {
+            ProgramParams unet_params{};
+            unet_params.model_path = unet_file_path;
+            std::vector<size_t> sample_input_dims = {1, 4, 64, 64};
+            std::vector<size_t> encoder_hidden_states_input_dims = {1, 77, 1024};
+            std::vector<size_t> timestep_input_dims = {1};
+            unet_params.input_tensors = {
+                TensorInfo{"sample", sample_input_dims, std::accumulate(sample_input_dims.begin(), sample_input_dims.end(), 1, std::multiplies<size_t>()) * sizeof(float), 0},
+                TensorInfo{"encoder_hidden_states", encoder_hidden_states_input_dims, std::accumulate(encoder_hidden_states_input_dims.begin(), encoder_hidden_states_input_dims.end(), 1, std::multiplies<size_t>()) * sizeof(float), 0},
+                TensorInfo{"timestep", timestep_input_dims, std::accumulate(timestep_input_dims.begin(), timestep_input_dims.end(), 1, std::multiplies<size_t>()) * sizeof(int64_t), 0},
+            };
+            this->unet_model = LoadProgram(/*device_id*/ 0, unet_params);
+        }
+
+        // vae-decoder
+        {
+            ProgramParams vae_decoder_params{};
+            vae_decoder_params.model_path = decoder_file_path;
+            std::vector<size_t> input_dims = {1, 4, 64, 64};
+            vae_decoder_params.input_tensors = {TensorInfo{"latent_sample", input_dims, std::accumulate(input_dims.begin(), input_dims.end(), 1, std::multiplies<size_t>()) * sizeof(float), 0}};
+            this->vae_decoder_model = LoadProgram(/*device_id*/ 0, vae_decoder_params);
+        }
+        return true;
+    }
+
+    ggml_tensor* get_learned_condition_migraphx(ggml_context* res_ctx, const std::string& text) {
+        auto tokens_and_weights = cond_stage_model.tokenize(text,
+                                                            cond_stage_model.text_model.max_position_embeddings,
+                                                            true);
+        std::vector<int>& tokens = tokens_and_weights.first;
+        std::vector<float>& weights = tokens_and_weights.second;
+
+        struct ggml_tensor* input_ids = ggml_new_tensor_1d(res_ctx, GGML_TYPE_I32, tokens.size()); // [1, 77]
+        memcpy(input_ids->data, tokens.data(), tokens.size() * ggml_element_size(input_ids));
+
+        // ggml to mgx
+        migraphx::program_parameters prog_params;
+        auto param_shapes = this->text_encoder_model.get_parameter_shapes();
+        auto input        = param_shapes.names().front();
+        prog_params.add(input, migraphx::argument(param_shapes[input], input_ids->data));
+
+        // eval
+        LOG_DEBUG("Model evaluating input...");
+        auto start   = std::chrono::high_resolution_clock::now();
+        auto outputs = this->text_encoder_model.eval(prog_params);
+        auto stop    = std::chrono::high_resolution_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(stop - start);
+        LOG_DEBUG("Inference complete");
+        LOG_DEBUG("Inference time: %f ms", elapsed.count() * 1e-3);
+
+        // mgx to ggml
+        struct ggml_tensor* hidden_states = ggml_new_tensor_3d(res_ctx, GGML_TYPE_F32, 1024, 77, 1);
+        memcpy(((char*)hidden_states->data), ((char*)outputs[0].data()), ggml_nbytes(hidden_states));
+        ggml_tensor* result = ggml_dup_tensor(res_ctx, hidden_states);
+
+        {
+            int64_t nelements = ggml_nelements(hidden_states);
+            float original_mean = 0.f;
+            float new_mean = 0.f;
+            float* vec = (float*)hidden_states->data;
+            for (int i = 0; i < nelements; i++) {
+                original_mean += vec[i] / nelements * 1.0f;
+            }
+
+            for (int i2 = 0; i2 < hidden_states->ne[2]; i2++) {
+                for (int i1 = 0; i1 < hidden_states->ne[1]; i1++) {
+                    for (int i0 = 0; i0 < hidden_states->ne[0]; i0++) {
+                        float value = ggml_tensor_get_f32(hidden_states, i0, i1, i2);
+                        value *= weights[i1];
+                        ggml_tensor_set_f32(result, value, i0, i1, i2);
+                    }
+                }
+            }
+
+            vec = (float*)result->data;
+            for (int i = 0; i < nelements; i++) {
+                new_mean += vec[i] / nelements * 1.0f;
+            }
+
+            for (int i = 0; i < nelements; i++) {
+                vec[i] = vec[i] * (original_mean / new_mean);
+            }
+        }
+
+        return result;  // [1, 77, 1024]
+    }
+
+    ggml_tensor* decode_first_stage_migraphx(ggml_context* res_ctx, ggml_tensor* z) {
+        struct ggml_tensor* result_img = ggml_new_tensor_4d(res_ctx, GGML_TYPE_F32, 512, 512, 3, 1);
+
+        {
+            float* vec = (float*)z->data;
+            for (int i = 0; i < ggml_nelements(z); i++) {
+                vec[i] = 1.0f / scale_factor * vec[i];
+            }
+        }
+
+        {
+
+            // ggml to mgx
+            migraphx::program_parameters prog_params;
+            auto param_shapes = this->vae_decoder_model.get_parameter_shapes();
+            auto input        = param_shapes.names().front();
+            prog_params.add(input, migraphx::argument(param_shapes[input], z->data));
+
+            // eval
+            LOG_DEBUG("Model evaluating input...");
+            auto start   = std::chrono::high_resolution_clock::now();
+            auto outputs = this->vae_decoder_model.eval(prog_params);
+            auto stop    = std::chrono::high_resolution_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(stop - start);
+            LOG_DEBUG("Inference complete");
+            LOG_DEBUG("Inference time: %f ms", elapsed.count() * 1e-3);
+
+            // mgx to ggml
+            memcpy(((char*)result_img->data), ((char*)outputs[0].data()), ggml_nbytes(result_img));
+        }
+
+        return result_img;
+    }
+
+    ggml_tensor* sample_migraphx(ggml_context* res_ctx,
+                                 ggml_tensor* x_t,
+                                 ggml_tensor* c,
+                                 ggml_tensor* uc,
+                                 float cfg_scale,
+                                 SampleMethod method,
+                                 const std::vector<float>& sigmas) {
+        size_t steps = sigmas.size() - 1;
+        // x_t = load_tensor_from_file(res_ctx, "./rand0.bin");
+        // print_ggml_tensor(x_t);
+        struct ggml_tensor* x = ggml_dup_tensor(res_ctx, x_t); // [1, 4, 64, 64]
+        copy_ggml_tensor(x, x_t);
+        struct ggml_tensor* out = ggml_dup_tensor(res_ctx, x_t); // [1, 4, 64, 64]
+
+        size_t ctx_size = 10 * 1024 * 1024;  // 10MB
+        // calculate the amount of memory required
+        {
+            struct ggml_init_params params;
+            params.mem_size = ctx_size;
+            params.mem_buffer = NULL;
+            params.no_alloc = true;
+            params.dynamic = dynamic;
+
+            struct ggml_context* ctx = ggml_init(params);
+            if (!ctx) {
+                LOG_ERROR("ggml_init() failed");
+                return NULL;
+            }
+
+            ggml_set_dynamic(ctx, false);
+            struct ggml_tensor* noised_input = ggml_dup_tensor(ctx, x_t);
+            struct ggml_tensor* context = ggml_dup_tensor(ctx, c);
+            struct ggml_tensor* timesteps = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);                           // [N, ]
+            struct ggml_tensor* t_emb = new_timestep_embedding(ctx, timesteps, diffusion_model.model_channels);  // [N, model_channels]
+            ggml_set_dynamic(ctx, params.dynamic);
+
+            ctx_size += ggml_used_mem(ctx) + ggml_used_mem_of_data(ctx);
+
+            ggml_free(ctx);
+        }
+
+        struct ggml_init_params params;
+        params.mem_size = ctx_size;
+        params.mem_buffer = NULL;
+        params.no_alloc = false;
+        params.dynamic = dynamic;
+
+        struct ggml_context* ctx = ggml_init(params);
+        if (!ctx) {
+            LOG_ERROR("ggml_init() failed");
+            return NULL;
+        }
+
+        ggml_set_dynamic(ctx, false);
+        struct ggml_tensor* noised_input = ggml_dup_tensor(ctx, x_t); // [1, 4, 64, 64] | sample
+        struct ggml_tensor* context = ggml_dup_tensor(ctx, c); // [1, 77, 1024] | encoder_hidden_states
+        // TODO this should be I64
+        // struct ggml_tensor* timesteps = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1); // [N] | timestep
+        // ggml_set_zero(timesteps);
+        std::vector<int64_t> timesteps = {0};
+        ggml_set_dynamic(ctx, params.dynamic);
+
+        // x = x * sigmas[0]
+        {
+            float* vec = (float*)x->data;
+            for (int i = 0; i < ggml_nelements(x); i++) {
+                vec[i] = vec[i] * sigmas[0];
+            }
+        }
+
+        // denoise wrapper
+        ggml_set_dynamic(ctx, false);
+        struct ggml_tensor* out_cond = NULL;
+        struct ggml_tensor* out_uncond = NULL;
+        if (cfg_scale != 1.0f && uc != NULL) {
+            out_uncond = ggml_dup_tensor(ctx, x);
+        }
+        struct ggml_tensor* denoised = ggml_dup_tensor(ctx, x);
+        ggml_set_dynamic(ctx, params.dynamic);
+
+        auto denoise = [&](ggml_tensor* input, float sigma, int step) {
+            int64_t t0 = ggml_time_ms();
+
+            float c_skip = 1.0f;
+            float c_out = 1.0f;
+            float c_in = 1.0f;
+            std::vector<float> scaling = denoiser->get_scalings(sigma);
+            if (scaling.size() == 3) {  // CompVisVDenoiser
+                c_skip = scaling[0];
+                c_out = scaling[1];
+                c_in = scaling[2];
+            } else {  // CompVisDenoiser
+                c_out = scaling[0];
+                c_in = scaling[1];
+            }
+
+            float t = denoiser->schedule->sigma_to_t(sigma);
+            int32_t it = static_cast<int32_t>(t);
+            LOG_DEBUG("step=%d t_orig=%f t_new=%d", step, t, it);
+            // ggml_set_i32(timesteps, it);
+            timesteps[0] = it;
+
+            copy_ggml_tensor(noised_input, input);
+            // noised_input = noised_input * c_in
+            {
+                float* vec = (float*)noised_input->data;
+                for (int i = 0; i < ggml_nelements(noised_input); i++) {
+                    vec[i] = vec[i] * c_in;
+                }
+            }
+
+            if (cfg_scale != 1.0 && uc != NULL) {
+                // uncond
+                copy_ggml_tensor(context, uc);
+                {
+                    // ggml to mgx
+                    migraphx::program_parameters prog_params;
+                    auto param_shapes = this->unet_model.get_parameter_shapes();
+                    prog_params.add("sample", migraphx::argument(param_shapes["sample"], noised_input->data));
+                    prog_params.add("encoder_hidden_states", migraphx::argument(param_shapes["encoder_hidden_states"], context->data));
+                    prog_params.add("timestep", migraphx::argument(param_shapes["timestep"], timesteps.data()));
+
+                    // eval
+                    LOG_DEBUG("Model evaluating input...");
+                    auto start   = std::chrono::high_resolution_clock::now();
+                    auto outputs = this->unet_model.eval(prog_params);
+                    auto stop    = std::chrono::high_resolution_clock::now();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(stop - start);
+                    LOG_DEBUG("Inference complete");
+                    LOG_DEBUG("Inference time: %f ms", elapsed.count() * 1e-3);
+
+                    // mgx to ggml
+                    memcpy(((char*)out->data), ((char*)outputs[0].data()), ggml_nbytes(out));
+                }
+                copy_ggml_tensor(out_uncond, out);
+
+                // cond
+                copy_ggml_tensor(context, c);
+                {
+                    // ggml to mgx
+                    migraphx::program_parameters prog_params;
+                    auto param_shapes = this->unet_model.get_parameter_shapes();
+                    prog_params.add("sample", migraphx::argument(param_shapes["sample"], noised_input->data));
+                    prog_params.add("encoder_hidden_states", migraphx::argument(param_shapes["encoder_hidden_states"], context->data));
+                    prog_params.add("timestep", migraphx::argument(param_shapes["timestep"], timesteps.data()));
+
+                    // eval
+                    LOG_DEBUG("Model evaluating input...");
+                    auto start   = std::chrono::high_resolution_clock::now();
+                    auto outputs = this->unet_model.eval(prog_params);
+                    auto stop    = std::chrono::high_resolution_clock::now();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(stop - start);
+                    LOG_DEBUG("Inference complete");
+                    LOG_DEBUG("Inference time: %f ms", elapsed.count() * 1e-3);
+
+                    // mgx to ggml
+                    memcpy(((char*)out->data), ((char*)outputs[0].data()), ggml_nbytes(out));
+                }
+
+                out_cond = out;
+
+                // out_uncond + cfg_scale * (out_cond - out_uncond)
+                {
+                    float* vec_out = (float*)out->data;
+                    float* vec_out_uncond = (float*)out_uncond->data;
+                    float* vec_out_cond = (float*)out_cond->data;
+
+                    for (int i = 0; i < ggml_nelements(out); i++) {
+                        vec_out[i] = vec_out_uncond[i] + cfg_scale * (vec_out_cond[i] - vec_out_uncond[i]);
+                    }
+                }
+            } else {
+                // cond
+                copy_ggml_tensor(context, c);
+                {
+                    // ggml to mgx
+                    migraphx::program_parameters prog_params;
+                    auto param_shapes = this->unet_model.get_parameter_shapes();
+                    prog_params.add("sample", migraphx::argument(param_shapes["sample"], noised_input->data));
+                    prog_params.add("encoder_hidden_states", migraphx::argument(param_shapes["encoder_hidden_states"], context->data));
+                    prog_params.add("timestep", migraphx::argument(param_shapes["timestep"], timesteps.data()));
+
+                    // eval
+                    LOG_DEBUG("Model evaluating input...");
+                    auto start   = std::chrono::high_resolution_clock::now();
+                    auto outputs = this->unet_model.eval(prog_params);
+                    auto stop    = std::chrono::high_resolution_clock::now();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(stop - start);
+                    LOG_DEBUG("Inference complete");
+                    LOG_DEBUG("Inference time: %f ms", elapsed.count() * 1e-3);
+
+                    // mgx to ggml
+                    memcpy(((char*)out->data), ((char*)outputs[0].data()), ggml_nbytes(out));
+                }
+            }
+
+            // v = out, eps = out
+            // denoised = (v * c_out + input * c_skip) or (input + eps * c_out)
+            {
+                float* vec_denoised = (float*)denoised->data;
+                float* vec_input = (float*)input->data;
+                float* vec_out = (float*)out->data;
+
+                for (int i = 0; i < ggml_nelements(denoised); i++) {
+                    vec_denoised[i] = vec_out[i] * c_out + vec_input[i] * c_skip;
+                }
+            }
+
+            int64_t t1 = ggml_time_ms();
+            if (step > 0) {
+                LOG_INFO("step %d sampling completed, taking %.2fs", step, (t1 - t0) * 1.0f / 1000);
+                LOG_DEBUG("diffusion graph use %.2fMB runtime memory: static %.2fMB, dynamic %.2fMB",
+                          (ctx_size + ggml_curr_max_dynamic_size()) * 1.0f / 1024 / 1024,
+                          ctx_size * 1.0f / 1024 / 1024,
+                          ggml_curr_max_dynamic_size() * 1.0f / 1024 / 1024);
+                LOG_DEBUG("%zu bytes of dynamic memory has not been released yet", ggml_dynamic_size());
+            }
+        };
+
+        // sample_euler_ancestral
+        switch (method) {
+            case EULER_A: {
+                LOG_INFO("sampling using Euler A method");
+                ggml_set_dynamic(ctx, false);
+                struct ggml_tensor* noise = ggml_dup_tensor(ctx, x);
+                struct ggml_tensor* d = ggml_dup_tensor(ctx, x);
+                ggml_set_dynamic(ctx, params.dynamic);
+
+                for (int i = 0; i < steps; i++) {
+                    float sigma = sigmas[i];
+
+                    // denoise
+                    denoise(x, sigma, i + 1);
+
+                    // d = (x - denoised) / sigma
+                    {
+                        float* vec_d = (float*)d->data;
+                        float* vec_x = (float*)x->data;
+                        float* vec_denoised = (float*)denoised->data;
+
+                        for (int i = 0; i < ggml_nelements(d); i++) {
+                            vec_d[i] = (vec_x[i] - vec_denoised[i]) / sigma;
+                        }
+                    }
+
+                    // get_ancestral_step
+                    float sigma_up = std::min(sigmas[i + 1],
+                                              std::sqrt(sigmas[i + 1] * sigmas[i + 1] * (sigmas[i] * sigmas[i] - sigmas[i + 1] * sigmas[i + 1]) / (sigmas[i] * sigmas[i])));
+                    float sigma_down = std::sqrt(sigmas[i + 1] * sigmas[i + 1] - sigma_up * sigma_up);
+
+                    // Euler method
+                    float dt = sigma_down - sigmas[i];
+                    // x = x + d * dt
+                    {
+                        float* vec_d = (float*)d->data;
+                        float* vec_x = (float*)x->data;
+
+                        for (int i = 0; i < ggml_nelements(x); i++) {
+                            vec_x[i] = vec_x[i] + vec_d[i] * dt;
+                        }
+                    }
+
+                    if (sigmas[i + 1] > 0) {
+                        // x = x + noise_sampler(sigmas[i], sigmas[i + 1]) * s_noise * sigma_up
+                        ggml_tensor_set_f32_randn(noise, rng);
+                        // noise = load_tensor_from_file(res_ctx, "./rand" + std::to_string(i+1) + ".bin");
+                        {
+                            float* vec_x = (float*)x->data;
+                            float* vec_noise = (float*)noise->data;
+
+                            for (int i = 0; i < ggml_nelements(x); i++) {
+                                vec_x[i] = vec_x[i] + vec_noise[i] * sigma_up;
+                            }
+                        }
+                    }
+                }
+            } break;
+            case EULER:  // Implemented without any sigma churn
+            {
+                LOG_INFO("sampling using Euler method");
+                ggml_set_dynamic(ctx, false);
+                struct ggml_tensor* d = ggml_dup_tensor(ctx, x);
+                ggml_set_dynamic(ctx, params.dynamic);
+
+                for (int i = 0; i < steps; i++) {
+                    float sigma = sigmas[i];
+
+                    // denoise
+                    denoise(x, sigma, i + 1);
+
+                    // d = (x - denoised) / sigma
+                    {
+                        float* vec_d = (float*)d->data;
+                        float* vec_x = (float*)x->data;
+                        float* vec_denoised = (float*)denoised->data;
+
+                        for (int j = 0; j < ggml_nelements(d); j++) {
+                            vec_d[j] = (vec_x[j] - vec_denoised[j]) / sigma;
+                        }
+                    }
+
+                    float dt = sigmas[i + 1] - sigma;
+                    // x = x + d * dt
+                    {
+                        float* vec_d = (float*)d->data;
+                        float* vec_x = (float*)x->data;
+
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            vec_x[j] = vec_x[j] + vec_d[j] * dt;
+                        }
+                    }
+                }
+            } break;
+            case HEUN: {
+                LOG_INFO("sampling using Heun method");
+                ggml_set_dynamic(ctx, false);
+                struct ggml_tensor* d = ggml_dup_tensor(ctx, x);
+                struct ggml_tensor* x2 = ggml_dup_tensor(ctx, x);
+                ggml_set_dynamic(ctx, params.dynamic);
+
+                for (int i = 0; i < steps; i++) {
+                    // denoise
+                    denoise(x, sigmas[i], -(i + 1));
+
+                    // d = (x - denoised) / sigma
+                    {
+                        float* vec_d = (float*)d->data;
+                        float* vec_x = (float*)x->data;
+                        float* vec_denoised = (float*)denoised->data;
+
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            vec_d[j] = (vec_x[j] - vec_denoised[j]) / sigmas[i];
+                        }
+                    }
+
+                    float dt = sigmas[i + 1] - sigmas[i];
+                    if (sigmas[i + 1] == 0) {
+                        // Euler step
+                        // x = x + d * dt
+                        float* vec_d = (float*)d->data;
+                        float* vec_x = (float*)x->data;
+
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            vec_x[j] = vec_x[j] + vec_d[j] * dt;
+                        }
+                    } else {
+                        // Heun step
+                        float* vec_d = (float*)d->data;
+                        float* vec_d2 = (float*)d->data;
+                        float* vec_x = (float*)x->data;
+                        float* vec_x2 = (float*)x2->data;
+
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            vec_x2[j] = vec_x[j] + vec_d[j] * dt;
+                        }
+
+                        denoise(x2, sigmas[i + 1], i + 1);
+                        float* vec_denoised = (float*)denoised->data;
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            float d2 = (vec_x2[j] - vec_denoised[j]) / sigmas[i + 1];
+                            vec_d[j] = (vec_d[j] + d2) / 2;
+                            vec_x[j] = vec_x[j] + vec_d[j] * dt;
+                        }
+                    }
+                }
+            } break;
+            case DPM2: {
+                LOG_INFO("sampling using DPM2 method");
+                ggml_set_dynamic(ctx, false);
+                struct ggml_tensor* d = ggml_dup_tensor(ctx, x);
+                struct ggml_tensor* x2 = ggml_dup_tensor(ctx, x);
+                ggml_set_dynamic(ctx, params.dynamic);
+
+                for (int i = 0; i < steps; i++) {
+                    // denoise
+                    denoise(x, sigmas[i], i + 1);
+
+                    // d = (x - denoised) / sigma
+                    {
+                        float* vec_d = (float*)d->data;
+                        float* vec_x = (float*)x->data;
+                        float* vec_denoised = (float*)denoised->data;
+
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            vec_d[j] = (vec_x[j] - vec_denoised[j]) / sigmas[i];
+                        }
+                    }
+
+                    if (sigmas[i + 1] == 0) {
+                        // Euler step
+                        // x = x + d * dt
+                        float dt = sigmas[i + 1] - sigmas[i];
+                        float* vec_d = (float*)d->data;
+                        float* vec_x = (float*)x->data;
+
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            vec_x[j] = vec_x[j] + vec_d[j] * dt;
+                        }
+                    } else {
+                        // DPM-Solver-2
+                        float sigma_mid = exp(0.5f * (log(sigmas[i]) + log(sigmas[i + 1])));
+                        float dt_1 = sigma_mid - sigmas[i];
+                        float dt_2 = sigmas[i + 1] - sigmas[i];
+
+                        float* vec_d = (float*)d->data;
+                        float* vec_x = (float*)x->data;
+                        float* vec_x2 = (float*)x2->data;
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            vec_x2[j] = vec_x[j] + vec_d[j] * dt_1;
+                        }
+
+                        denoise(x2, sigma_mid, i + 1);
+                        float* vec_denoised = (float*)denoised->data;
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            float d2 = (vec_x2[j] - vec_denoised[j]) / sigma_mid;
+                            vec_x[j] = vec_x[j] + d2 * dt_2;
+                        }
+                    }
+                }
+
+            } break;
+            case DPMPP2S_A: {
+                LOG_INFO("sampling using DPM++ (2s) a method");
+                ggml_set_dynamic(ctx, false);
+                struct ggml_tensor* noise = ggml_dup_tensor(ctx, x);
+                struct ggml_tensor* d = ggml_dup_tensor(ctx, x);
+                struct ggml_tensor* x2 = ggml_dup_tensor(ctx, x);
+                ggml_set_dynamic(ctx, params.dynamic);
+
+                for (int i = 0; i < steps; i++) {
+                    // denoise
+                    denoise(x, sigmas[i], i + 1);
+
+                    // get_ancestral_step
+                    float sigma_up = std::min(sigmas[i + 1],
+                                              std::sqrt(sigmas[i + 1] * sigmas[i + 1] * (sigmas[i] * sigmas[i] - sigmas[i + 1] * sigmas[i + 1]) / (sigmas[i] * sigmas[i])));
+                    float sigma_down = std::sqrt(sigmas[i + 1] * sigmas[i + 1] - sigma_up * sigma_up);
+                    auto t_fn = [](float sigma) -> float { return -log(sigma); };
+                    auto sigma_fn = [](float t) -> float { return exp(-t); };
+
+                    if (sigma_down == 0) {
+                        // Euler step
+                        float* vec_d = (float*)d->data;
+                        float* vec_x = (float*)x->data;
+                        float* vec_denoised = (float*)denoised->data;
+
+                        for (int j = 0; j < ggml_nelements(d); j++) {
+                            vec_d[j] = (vec_x[j] - vec_denoised[j]) / sigmas[i];
+                        }
+
+                        // TODO: If sigma_down == 0, isn't this wrong?
+                        // But
+                        // https://github.com/crowsonkb/k-diffusion/blob/master/k_diffusion/sampling.py#L525
+                        // has this exactly the same way.
+                        float dt = sigma_down - sigmas[i];
+                        for (int j = 0; j < ggml_nelements(d); j++) {
+                            vec_x[j] = vec_x[j] + vec_d[j] * dt;
+                        }
+                    } else {
+                        // DPM-Solver++(2S)
+                        float t = t_fn(sigmas[i]);
+                        float t_next = t_fn(sigma_down);
+                        float h = t_next - t;
+                        float s = t + 0.5f * h;
+
+                        float* vec_d = (float*)d->data;
+                        float* vec_x = (float*)x->data;
+                        float* vec_x2 = (float*)x2->data;
+                        float* vec_denoised = (float*)denoised->data;
+
+                        // First half-step
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            vec_x2[j] = (sigma_fn(s) / sigma_fn(t)) * vec_x[j] - (exp(-h * 0.5f) - 1) * vec_denoised[j];
+                        }
+
+                        denoise(x2, sigmas[i + 1], i + 1);
+
+                        // Second half-step
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            vec_x[j] = (sigma_fn(t_next) / sigma_fn(t)) * vec_x[j] - (exp(-h) - 1) * vec_denoised[j];
+                        }
+                    }
+
+                    // Noise addition
+                    if (sigmas[i + 1] > 0) {
+                        ggml_tensor_set_f32_randn(noise, rng);
+                        {
+                            float* vec_x = (float*)x->data;
+                            float* vec_noise = (float*)noise->data;
+
+                            for (int i = 0; i < ggml_nelements(x); i++) {
+                                vec_x[i] = vec_x[i] + vec_noise[i] * sigma_up;
+                            }
+                        }
+                    }
+                }
+            } break;
+            case DPMPP2M:  // DPM++ (2M) from Karras et al (2022)
+            {
+                LOG_INFO("sampling using DPM++ (2M) method");
+                ggml_set_dynamic(ctx, false);
+                struct ggml_tensor* old_denoised = ggml_dup_tensor(ctx, x);
+                ggml_set_dynamic(ctx, params.dynamic);
+
+                auto t_fn = [](float sigma) -> float { return -log(sigma); };
+
+                for (int i = 0; i < steps; i++) {
+                    // denoise
+                    denoise(x, sigmas[i], i + 1);
+
+                    float t = t_fn(sigmas[i]);
+                    float t_next = t_fn(sigmas[i + 1]);
+                    float h = t_next - t;
+                    float a = sigmas[i + 1] / sigmas[i];
+                    float b = exp(-h) - 1.f;
+                    float* vec_x = (float*)x->data;
+                    float* vec_denoised = (float*)denoised->data;
+                    float* vec_old_denoised = (float*)old_denoised->data;
+
+                    if (i == 0 || sigmas[i + 1] == 0) {
+                        // Simpler step for the edge cases
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            vec_x[j] = a * vec_x[j] - b * vec_denoised[j];
+                        }
+                    } else {
+                        float h_last = t - t_fn(sigmas[i - 1]);
+                        float r = h_last / h;
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            float denoised_d = (1.f + 1.f / (2.f * r)) * vec_denoised[j] - (1.f / (2.f * r)) * vec_old_denoised[j];
+                            vec_x[j] = a * vec_x[j] - b * denoised_d;
+                        }
+                    }
+
+                    // old_denoised = denoised
+                    for (int j = 0; j < ggml_nelements(x); j++) {
+                        vec_old_denoised[j] = vec_denoised[j];
+                    }
+                }
+            } break;
+            case DPMPP2Mv2:  // Modified DPM++ (2M) from https://github.com/AUTOMATIC1111/stable-diffusion-webui/discussions/8457
+            {
+                LOG_INFO("sampling using modified DPM++ (2M) method");
+                ggml_set_dynamic(ctx, false);
+                struct ggml_tensor* old_denoised = ggml_dup_tensor(ctx, x);
+                ggml_set_dynamic(ctx, params.dynamic);
+
+                auto t_fn = [](float sigma) -> float { return -log(sigma); };
+
+                for (int i = 0; i < steps; i++) {
+                    // denoise
+                    denoise(x, sigmas[i], i + 1);
+
+                    float t = t_fn(sigmas[i]);
+                    float t_next = t_fn(sigmas[i + 1]);
+                    float h = t_next - t;
+                    float a = sigmas[i + 1] / sigmas[i];
+                    float* vec_x = (float*)x->data;
+                    float* vec_denoised = (float*)denoised->data;
+                    float* vec_old_denoised = (float*)old_denoised->data;
+
+                    if (i == 0 || sigmas[i + 1] == 0) {
+                        // Simpler step for the edge cases
+                        float b = exp(-h) - 1.f;
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            vec_x[j] = a * vec_x[j] - b * vec_denoised[j];
+                        }
+                    } else {
+                        float h_last = t - t_fn(sigmas[i - 1]);
+                        float h_min = std::min(h_last, h);
+                        float h_max = std::max(h_last, h);
+                        float r = h_max / h_min;
+                        float h_d = (h_max + h_min) / 2.f;
+                        float b = exp(-h_d) - 1.f;
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            float denoised_d = (1.f + 1.f / (2.f * r)) * vec_denoised[j] - (1.f / (2.f * r)) * vec_old_denoised[j];
+                            vec_x[j] = a * vec_x[j] - b * denoised_d;
+                        }
+                    }
+
+                    // old_denoised = denoised
+                    for (int j = 0; j < ggml_nelements(x); j++) {
+                        vec_old_denoised[j] = vec_denoised[j];
+                    }
+                }
+            } break;
+
+            default:
+                LOG_ERROR("Attempting to sample with nonexisting sample method %i", method);
+                abort();
+        }
+
+        size_t rt_mem_size = ctx_size + ggml_curr_max_dynamic_size();
+        if (rt_mem_size > max_rt_mem_size) {
+            max_rt_mem_size = rt_mem_size;
+        }
+        size_t graph_mem_size = ggml_used_mem(unet_params_ctx) + rt_mem_size;
+
+        size_t curr_mem_size = curr_params_mem_size + rt_mem_size;
+        if (curr_mem_size > max_mem_size) {
+            max_mem_size = curr_mem_size;
+        }
+
+        LOG_INFO(
+            "diffusion graph use %.2fMB of memory: params %.2fMB, "
+            "runtime %.2fMB (static %.2fMB, dynamic %.2fMB)",
+            graph_mem_size * 1.0f / 1024 / 1024,
+            ggml_used_mem(unet_params_ctx) * 1.0f / 1024 / 1024,
+            rt_mem_size * 1.0f / 1024 / 1024,
+            ctx_size * 1.0f / 1024 / 1024,
+            ggml_curr_max_dynamic_size() * 1.0f / 1024 / 1024);
+        LOG_DEBUG("%zu bytes of dynamic memory has not been released yet", ggml_dynamic_size());
+
+        ggml_free(ctx);
+
+        return x;
+    }
 };
 
 /*================================================= StableDiffusion ==================================================*/
@@ -4208,6 +5101,12 @@ bool StableDiffusion::load_from_file(const std::string& file_path, Schedule s) {
     return sd->load_from_file(file_path, s);
 }
 
+bool StableDiffusion::load_migraphx_from_file(const std::string& text_encoder_file_path,
+                                              const std::string& unet_file_path,
+                                              const std::string& decoder_file_path) {
+    return sd->load_migraphx_from_file(text_encoder_file_path, unet_file_path, decoder_file_path);
+}
+
 std::vector<uint8_t> StableDiffusion::txt2img(const std::string& prompt,
                                               const std::string& negative_prompt,
                                               float cfg_scale,
@@ -4215,7 +5114,8 @@ std::vector<uint8_t> StableDiffusion::txt2img(const std::string& prompt,
                                               int height,
                                               SampleMethod sample_method,
                                               int sample_steps,
-                                              int64_t seed) {
+                                              int64_t seed,
+                                              bool use_migraphx = false) {
     std::vector<uint8_t> result;
     struct ggml_init_params params;
     params.mem_size = static_cast<size_t>(10 * 1024) * 1024;  // 10M
@@ -4235,10 +5135,20 @@ std::vector<uint8_t> StableDiffusion::txt2img(const std::string& prompt,
     sd->rng->manual_seed(seed);
 
     int64_t t0 = ggml_time_ms();
-    ggml_tensor* c = sd->get_learned_condition(ctx, prompt);
+    struct ggml_tensor* c = NULL;
+    if (use_migraphx) {
+        c = sd->get_learned_condition_migraphx(ctx, prompt);
+    } else {
+        c = sd->get_learned_condition(ctx, prompt);
+    }
+
     struct ggml_tensor* uc = NULL;
     if (cfg_scale != 1.0) {
-        uc = sd->get_learned_condition(ctx, negative_prompt);
+        if (use_migraphx) {
+            uc = sd->get_learned_condition_migraphx(ctx, negative_prompt);
+        } else {
+            uc = sd->get_learned_condition(ctx, negative_prompt);
+        }
     }
     int64_t t1 = ggml_time_ms();
     LOG_INFO("get_learned_condition completed, taking %.2fs", (t1 - t0) * 1.0f / 1000);
@@ -4258,7 +5168,12 @@ std::vector<uint8_t> StableDiffusion::txt2img(const std::string& prompt,
     std::vector<float> sigmas = sd->denoiser->schedule->get_sigmas(sample_steps);
 
     LOG_INFO("start sampling");
-    struct ggml_tensor* x_0 = sd->sample(ctx, x_t, c, uc, cfg_scale, sample_method, sigmas);
+    struct ggml_tensor* x_0 = NULL;
+    if (use_migraphx) {
+        x_0 = sd->sample_migraphx(ctx, x_t, c, uc, cfg_scale, sample_method, sigmas);
+    } else {
+        x_0 = sd->sample(ctx, x_t, c, uc, cfg_scale, sample_method, sigmas);
+    }
     // struct ggml_tensor* x_0 = load_tensor_from_file(ctx, "samples_ddim.bin");
     // print_ggml_tensor(x_0);
     int64_t t2 = ggml_time_ms();
@@ -4270,7 +5185,13 @@ std::vector<uint8_t> StableDiffusion::txt2img(const std::string& prompt,
         sd->unet_params_ctx = NULL;
     }
 
-    struct ggml_tensor* img = sd->decode_first_stage(ctx, x_0);
+    struct ggml_tensor* img = NULL;
+    if (use_migraphx) {
+        img = sd->decode_first_stage_migraphx(ctx, x_0);
+    } else {
+        img = sd->decode_first_stage(ctx, x_0);
+    }
+
     if (img != NULL) {
         result = ggml_to_image_vec(img);
     }
@@ -4304,7 +5225,8 @@ std::vector<uint8_t> StableDiffusion::img2img(const std::vector<uint8_t>& init_i
                                               SampleMethod sample_method,
                                               int sample_steps,
                                               float strength,
-                                              int64_t seed) {
+                                              int64_t seed,
+                                              bool use_migraphx = false) {
     std::vector<uint8_t> result;
     if (init_img_vec.size() != width * height * 3) {
         return result;
