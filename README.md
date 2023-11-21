@@ -6,6 +6,41 @@
 
 Inference of [Stable Diffusion](https://github.com/CompVis/stable-diffusion) in pure C/C++
 
+## MIGraphX Version
+
+### Docker
+```bash
+docker build -t sd -f Dockerfile.migraphx .
+```
+
+```bash
+docker run -it -v=`pwd`:/code/sd -w /code/sd --device=/dev/kfd --device=/dev/dri --group-add video --name sd.cpp-migraphx sd
+```
+
+### Models
+
+```bash
+curl -L -O https://huggingface.co/stabilityai/stable-diffusion-2-1/resolve/main/v2-1_768-ema-pruned.ckpt -o models/v2-1_768-ema-pruned.ckpt
+optimum-cli export onnx --model stabilityai/stable-diffusion-2-1 models/sd21-onnx
+pip install -r requirements.txt
+python convert.py models/v2-1_768-ema-pruned.ckpt --out_type f32 --out_file models/v2-1_768-ema-pruned-f32.bin
+```
+
+### Build
+
+```bash
+mkdir -p build && cd build
+cmake .. -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++
+make -j
+cd ..
+```
+
+### Run
+
+```bash
+./build/bin/sd -m models/v2-1_768-ema-pruned-f32.bin -p "a photograph of an astronaut riding a horse" -o astro_horse.png --steps 50 --seed 1234 --verbose --text-encoder-model-path models/sd21-onnx/text_encoder/model.onnx --unet-model-path models/sd21-onnx/unet/model.onnx  --decoder-model-path models/sd21-onnx/vae_decoder/model.onnx --use-migraphx
+```
+
 ## Features
 
 - Plain C/C++ implementation based on [ggml](https://github.com/ggerganov/ggml), working in the same way as [llama.cpp](https://github.com/ggerganov/llama.cpp)
